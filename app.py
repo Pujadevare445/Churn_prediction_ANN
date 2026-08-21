@@ -1,6 +1,7 @@
 import os
 import io
 import numpy as np
+import h5py
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
@@ -8,37 +9,52 @@ app = Flask(__name__)
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'ANN.pkl')
 FEATURE_NAMES = [f"Feature {i+1}" for i in range(10)]
 
-session = None
+class LightweightANN:
+    """Pure NumPy inference engine extracting weights directly from HDF5 binary inside PKL."""
+    def __init__(self, pkl_path):
+        with open(pkl_path, 'rb') as f:
+            data = f.read()
 
-def load_onnx_model():
-    """Converts Keras model to ONNX runtime session to minimize memory footprint."""
-    global session
-    import tf2onnx
-    import tensorflow as tf
-    import onnxruntime as ort
+        # Find starting offset of HDF5 binary signature (\x89HDF)
+        h5_offset = data.find(b'\x89HDF\r\n\x1a\n')
+        if h5_offset == -1:
+            raise ValueError("HDF5 binary payload missing from PKL file.")
 
-    try:
-        # Load Keras model from pkl file
-        keras_model = tf.keras.models.load_model(MODEL_PATH)
-        
-        # Define input signature matching model config (10 features)
-        input_signature = [tf.TensorSpec([None, 10], tf.float32, name='input')]
-        
-        # Convert to ONNX format in-memory
-        onnx_model, _ = tf2onnx.convert.from_keras(
-            keras_model, 
-            input_signature=input_signature
-        )
-        
-        # Create lightweight ONNX Runtime session
-        session = ort.InferenceSession(onnx_model.SerializeToString())
-        print("Model converted to ONNX and loaded successfully.")
-    except Exception as e:
-        print(f"Error initializing model: {e}")
-        session = None
+        # Read layer weights into NumPy arrays
+        h5_bytes = io.BytesIO(data[h5_offset:])
+        with h5py.File(h5_bytes, 'r') as h5f:
+            vars_grp = h5f['vars']
+            
+            # Dense Layer 1: 10 inputs -> 8 hidden nodes (ReLU)
+            self.w0 = np.array(vars_grp['0']['0'])
+            self.b0 = np.array(vars_grp['0']['1'])
+            
+            # Dense Layer 2: 8 hidden nodes -> 7 hidden nodes (ReLU)
+            self.w1 = np.array(vars_grp['1']['0'])
+            self.b1 = np.array(vars_grp['1']['1'])
+            
+            # Dense Layer 3: 7 hidden nodes -> 1 output node (Sigmoid)
+            self.w2 = np.array(vars_grp['2']['0'])
+            self.b2 = np.array(vars_grp['2']['1'])
 
-# Initialize model
-load_onnx_model()
+    def predict(self, x):
+        """Forward pass matching original Keras architecture."""
+        # Layer 1: Dense + ReLU activation
+        h1 = np.maximum(0, np.dot(x, self.w0) + self.b0)
+        # Layer 2: Dense + ReLU activation
+        h2 = np.maximum(0, np.dot(h1, self.w1) + self.b1)
+        # Layer 3: Dense + Sigmoid activation
+        z3 = np.dot(h2, self.w2) + self.b2
+        out = 1.0 / (1.0 + np.exp(-z3))
+        return float(out[0][0])
+
+# Initialize model on server start
+try:
+    model = LightweightANN(MODEL_PATH)
+    print("Lightweight ANN loaded successfully.")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    model = None
 
 @app.route('/')
 def home():
@@ -46,21 +62,18 @@ def home():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if session is None:
+    if model is None:
         return jsonify({'error': 'Model failed to load on server.'}), 500
 
     try:
         data = request.form
         input_data = [float(data.get(name, 0.0)) for name in FEATURE_NAMES]
         
-        # Prepare input array (1, 10) float32
+        # Reshape to (1, 10) array
         input_array = np.array([input_data], dtype=np.float32)
         
-        # Perform inference via ONNX Runtime
-        input_name = session.get_inputs()[0].name
-        raw_prediction = session.run(None, {input_name: input_array})[0][0][0]
-        
-        probability = float(raw_prediction)
+        # Forward pass inference
+        probability = model.predict(input_array)
         predicted_class = 1 if probability >= 0.5 else 0
         confidence = probability if predicted_class == 1 else (1.0 - probability)
 
