@@ -1,5 +1,4 @@
 Flask>=3.0.0
 numpy>=1.26.0
-tf2onnx>=1.16.0
-onnxruntime>=1.17.0
+h5py>=3.10.0
 gunicorn>=21.2.0
