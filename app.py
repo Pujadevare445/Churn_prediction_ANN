@@ -23,33 +23,41 @@ class LightweightANN:
         if h5_offset == -1:
             raise ValueError("HDF5 binary payload missing from PKL file.")
 
-        # Read layer weights into NumPy arrays
         h5_bytes = io.BytesIO(data[h5_offset:])
         with h5py.File(h5_bytes, 'r') as h5f:
-            vars_grp = h5f['vars']
+            weights_list = []
+
+            # Dynamically traverse the HDF5 tree to collect all weight and bias datasets
+            def visitor(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    weights_list.append(np.array(obj, dtype=np.float32))
+
+            h5f.visititems(visitor)
+
+            if len(weights_list) < 6:
+                raise ValueError(f"Expected 6 weight/bias datasets, but found {len(weights_list)}.")
+
+            # Assign weights and biases in execution order
+            # Layer 1: Dense 10 -> 8
+            self.w0 = weights_list[0]
+            self.b0 = weights_list[1]
             
-            # Dense Layer 1: 10 inputs -> 8 hidden nodes (ReLU)
-            self.w0 = np.array(vars_grp['0']['0'], dtype=np.float32)
-            self.b0 = np.array(vars_grp['0']['1'], dtype=np.float32)
+            # Layer 2: Dense 8 -> 7
+            self.w1 = weights_list[2]
+            self.b1 = weights_list[3]
             
-            # Dense Layer 2: 8 hidden nodes -> 7 hidden nodes (ReLU)
-            self.w1 = np.array(vars_grp['1']['0'], dtype=np.float32)
-            self.b1 = np.array(vars_grp['1']['1'], dtype=np.float32)
-            
-            # Dense Layer 3: 7 hidden nodes -> 1 output node (Sigmoid)
-            self.w2 = np.array(vars_grp['2']['0'], dtype=np.float32)
-            self.b2 = np.array(vars_grp['2']['1'], dtype=np.float32)
+            # Layer 3: Dense 7 -> 1
+            self.w2 = weights_list[4]
+            self.b2 = weights_list[5]
 
     def predict(self, x):
-        """Forward pass with numerically stable activation functions."""
-        # Layer 1: Dense + ReLU activation
+        """Forward propagation pass using NumPy."""
+        # Layer 1: Dense + ReLU
         h1 = np.maximum(0, np.dot(x, self.w0) + self.b0)
-        # Layer 2: Dense + ReLU activation
+        # Layer 2: Dense + ReLU
         h2 = np.maximum(0, np.dot(h1, self.w1) + self.b1)
-        # Layer 3: Dense + Numerically Stable Sigmoid activation
+        # Layer 3: Dense + Sigmoid
         z3 = np.dot(h2, self.w2) + self.b2
-        
-        # Clip z3 values to prevent floating point overflow in exp()
         z3_clipped = np.clip(z3, -500, 500)
         out = 1.0 / (1.0 + np.exp(-z3_clipped))
         return float(out[0][0])
@@ -60,7 +68,7 @@ model_error_msg = None
 
 try:
     model = LightweightANN(MODEL_PATH)
-    print("Lightweight ANN loaded successfully.")
+    print("Lightweight ANN weights mapped successfully.")
 except Exception as e:
     model_error_msg = str(e)
     print(f"Error loading model: {e}")
@@ -75,14 +83,13 @@ def predict():
         return render_template(
             'index.html', 
             features=FEATURE_NAMES, 
-            error=f"Model is not initialized: {model_error_msg}"
+            error=f"Model error: {model_error_msg}"
         ), 500
 
     try:
         data = request.form
         input_data = []
 
-        # Parse inputs with fallback values to prevent KeyError
         for name in FEATURE_NAMES:
             raw_val = data.get(name, "0.0")
             try:
@@ -91,10 +98,8 @@ def predict():
                 val = 0.0
             input_data.append(val)
         
-        # Reshape to (1, 10) array
         input_array = np.array([input_data], dtype=np.float32)
         
-        # Forward pass inference
         probability = model.predict(input_array)
         predicted_class = 1 if probability >= 0.5 else 0
         confidence = probability if predicted_class == 1 else (1.0 - probability)
@@ -109,7 +114,6 @@ def predict():
         )
 
     except Exception as e:
-        # Catch internal processing errors gracefully without crashing to 500 page
         return render_template(
             'index.html', 
             features=FEATURE_NAMES, 
